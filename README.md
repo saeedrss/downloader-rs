@@ -27,16 +27,6 @@ cargo run --release -- --url <URL> --proxies proxies.txt
 ./target/release/downloader --url <URL> --proxies proxies.txt
 ```
 
-### Python counterparts (in parent directory)
-
-```bash
-# Headless CLI
-python ../v0.4.py --url <URL> --proxies proxies.txt
-
-# Python TUI
-python ../ui.py --url <URL> --proxies proxies.txt
-```
-
 ## CLI Options
 
 | Argument             | Default                      | Description                                     |
