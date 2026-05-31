@@ -128,13 +128,14 @@ async fn process_url(
     chunk_size_mb: u32,
     max_connections: u32,
     proxy_urls: &[String],
-    _multi_use: bool,
+    multi_use: bool,
     output_path: &Path,
     temp_dir: &Path,
     dyn_state: DynState,
     log: Arc<dyn Fn(&str) + Send + Sync + 'static>,
     on_part_update: Arc<dyn Fn(u32, &str, &str, f64) + Send + Sync + 'static>,
     on_progress: Arc<dyn Fn(u32, u32) + Send + Sync + 'static>,
+    on_proxy_update: Arc<dyn Fn(Vec<(String, f64, u64)>) + Send + Sync + 'static>,
 ) {
     let chunk_size = (chunk_size_mb as u64) * 1024 * 1024;
 
@@ -178,6 +179,32 @@ async fn process_url(
     }
     let total_parts_needed = chunks.len() as u32;
     log(&format!("[*] Total planned parts: {}", total_parts_needed));
+
+    // Scan for already-downloaded parts
+    let initial_done: Vec<u32> = chunks
+        .iter()
+        .filter(|(start, end, p_num)| {
+            let part_path = dl_dir.join(format!("part_{}.tmp", get_hex_name(*p_num)));
+            if part_path.exists() {
+                let expected = end - start + 1;
+                std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0) == expected
+            } else {
+                false
+            }
+        })
+        .map(|(_, _, p)| *p)
+        .collect();
+    let initial_count = initial_done.len() as u32;
+    if initial_count > 0 {
+        log(&format!(
+            "[*] Found {} already-downloaded parts, skipping.",
+            initial_count
+        ));
+        for pn in &initial_done {
+            on_part_update(*pn, "finished", "(cached)", 0.0);
+        }
+        on_progress(initial_count, total_parts_needed);
+    }
 
     let dyn_mc = dyn_state.max_connections.clone();
     let sem = Arc::new(DynamicSemaphore::with_getter(
@@ -231,6 +258,8 @@ async fn process_url(
 
     // Worker tasks — one per chunk
     let mut handles = Vec::new();
+    let completed_parts = Arc::new(AtomicU64::new(initial_count as u64));
+    let total_parts = chunks.len() as u32;
     for chunk in chunks {
         let dl_dir_c = dl_dir.clone();
         let url_c = url.to_string();
@@ -242,90 +271,124 @@ async fn process_url(
         let dyn_state_c = dyn_state.clone();
         let log_c = log.clone();
         let part_cb = on_part_update.clone();
+        let proxy_cb = on_proxy_update.clone();
+        let completed_c = completed_parts.clone();
+        let prog_cb = on_progress.clone();
+        let total = total_parts;
 
         handles.push(tokio::spawn(async move {
             let (start, end, p_num) = chunk;
             let mut success = false;
+
+            // Default mode: pin this chunk to one dedicated proxy
+            let dedicated = if !multi_use {
+                let idx = p_num as usize % proxy_clients_c.len();
+                let (u, c) = proxy_clients_c[idx].clone();
+                Some((u, c))
+            } else {
+                None
+            };
+
             while !success {
                 dyn_state_c.wait_while_paused().await;
 
                 let _guard = sem_c.acquire().await;
+                // Re-check pause after acquiring semaphore (might have queued before pause)
+                dyn_state_c.wait_while_paused().await;
                 attempt_counter_c.fetch_add(1, Ordering::Release);
 
-                // Pick best available proxy
-                let selected = {
-                    let ap = active_proxies_c.lock().await;
-                    let sorted = {
+                let (proxy_url, client) = if let Some(ref d) = dedicated {
+                    d.clone()
+                } else {
+                    // multi_use mode: pick best available proxy
+                    let selected = {
+                        let ap = active_proxies_c.lock().await;
                         let ps = proxy_stats_c.lock().await;
                         let mut pairs: Vec<(&String, f64)> = ap
                             .iter()
                             .map(|u| {
-                                let avg = ps.get(u).map(|s| s.avg_time()).unwrap_or(0.0);
+                                let avg = ps.get(u).map(|s| s.avg_time()).unwrap_or(f64::MAX);
                                 (u, avg)
                             })
                             .collect();
                         pairs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-                        pairs
+                        let best_avg = pairs.first().map(|(_, a)| *a).unwrap_or(0.0);
+                        let tie_count = pairs.iter().filter(|(_, a)| *a == best_avg).count();
+                        let idx = (p_num as usize) % tie_count;
+                        pairs.get(idx).map(|(u, _)| (*u).clone())
                     };
-                    sorted.first().map(|(u, _)| (*u).clone())
+
+                    match selected {
+                        Some(ref u) => {
+                            let c = proxy_clients_c
+                                .iter()
+                                .find(|(pu, _)| pu == u)
+                                .map(|(_, c)| c.clone())
+                                .unwrap_or_else(|| {
+                                    let p = Proxy::all(u).unwrap();
+                                    reqwest::Client::builder()
+                                        .proxy(p)
+                                        .build()
+                                        .unwrap()
+                                });
+                            (u.clone(), c)
+                        }
+                        None => {
+                            log_c("[X] No proxy available, sleeping 10s...");
+                            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                            continue;
+                        }
+                    }
                 };
 
-                if let Some(ref proxy_url) = selected {
-                    let part_name = get_hex_name(p_num);
-                    log_c(&format!("[ ] Part {} → {}", part_name, proxy_url));
-                    part_cb(p_num, "downloading", "", 0.0);
+                let part_name = get_hex_name(p_num);
+                log_c(&format!("[ ] Part {} → {}", part_name, proxy_url));
+                part_cb(p_num, "downloading", "", 0.0);
 
-                    let client = proxy_clients_c
-                        .iter()
-                        .find(|(u, _)| u == proxy_url)
-                        .map(|(_, c)| c.clone())
-                        .unwrap_or_else(|| {
-                            let p = Proxy::all(proxy_url).unwrap();
-                            reqwest::Client::builder()
-                                .proxy(p)
-                                .build()
-                                .unwrap()
-                        });
-
-                    match download_chunk(
-                        &client,
-                        &url_c,
-                        start,
-                        end,
-                        p_num,
-                        &dl_dir_c,
-                        &dyn_state_c,
-                        &log_c,
-                    )
-                    .await
-                    {
-                        Ok((true, elapsed)) => {
+                match download_chunk(
+                    &client,
+                    &url_c,
+                    start,
+                    end,
+                    p_num,
+                    &dl_dir_c,
+                    &dyn_state_c,
+                    &log_c,
+                )
+                .await
+                {
+                    Ok((true, elapsed)) => {
+                        if elapsed > 0.0 {
                             let mut ps = proxy_stats_c.lock().await;
                             ps.entry(proxy_url.clone())
                                 .or_insert_with(ProxyStats::new)
                                 .record(elapsed);
-                            success = true;
-                            part_cb(p_num, "finished", proxy_url, elapsed);
+                            let items: Vec<(String, f64, u64)> = ps
+                                .iter()
+                                .map(|(u, s)| (u.clone(), s.avg_time(), s.successes.load(Ordering::Acquire)))
+                                .collect();
+                            proxy_cb(items);
+                            let done = completed_c.fetch_add(1, Ordering::Release) + 1;
+                            prog_cb(done as u32, total);
                         }
-                        Ok((false, _)) => {
-                            log_c(&format!(
-                                "[X] Part {} failed, retrying...",
-                                get_hex_name(p_num)
-                            ));
-                            part_cb(p_num, "error", "", 0.0);
-                        }
-                        Err(e) => {
-                            log_c(&format!(
-                                "[X] Part {} error: {}, retrying...",
-                                get_hex_name(p_num),
-                                e
-                            ));
-                            part_cb(p_num, "error", "", 0.0);
-                        }
+                        success = true;
+                        part_cb(p_num, "finished", &proxy_url, elapsed);
                     }
-                } else {
-                    log_c("[X] No proxy available, sleeping 10s...");
-                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    Ok((false, _)) => {
+                        log_c(&format!(
+                            "[X] Part {} failed, retrying...",
+                            get_hex_name(p_num)
+                        ));
+                        part_cb(p_num, "error", "", 0.0);
+                    }
+                    Err(e) => {
+                        log_c(&format!(
+                            "[X] Part {} error: {}, retrying...",
+                            get_hex_name(p_num),
+                            e
+                        ));
+                        part_cb(p_num, "error", "", 0.0);
+                    }
                 }
             }
         }));
@@ -519,6 +582,11 @@ fn main() -> Result<()> {
                         let _ = prog_tx.send(UiEvent::Progress(tab_idx, done, total));
                     });
 
+                    let proxy_tx = d_tx.clone();
+                    let proxy_cb = Arc::new(move |items: Vec<(String, f64, u64)>| {
+                        let _ = proxy_tx.send(UiEvent::ProxyUpdate(tab_idx, items));
+                    });
+
                     process_url(
                         url,
                         d_size,
@@ -531,6 +599,7 @@ fn main() -> Result<()> {
                         log,
                         part_cb,
                         prog_cb,
+                        proxy_cb,
                     )
                     .await;
 

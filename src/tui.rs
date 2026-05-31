@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
@@ -27,6 +27,7 @@ pub enum UiEvent {
     Progress(usize, u32, u32),
     FileStart(usize, String, u32),
     FileComplete(usize),
+    ProxyUpdate(usize, Vec<(String, f64, u64)>),
     AllDone,
 }
 
@@ -448,6 +449,11 @@ pub fn run_tui(
                     }
                 }
                 UiEvent::FileComplete(_tab_idx) => {}
+                UiEvent::ProxyUpdate(tab_idx, items) => {
+                    if tab_idx < state.tabs.len() {
+                        state.tabs[tab_idx].proxy_items = items;
+                    }
+                }
                 UiEvent::AllDone => {
                     state.all_done = true;
                     all_done_time = Some(std::time::Instant::now());
@@ -463,14 +469,20 @@ pub fn run_tui(
         // Keyboard
         if crossterm::event::poll(Duration::from_millis(50))? {
             match event::read()? {
-                Event::Key(key) => {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => {
                             break Ok(());
                         }
                         KeyCode::Char('p') | KeyCode::Char('P') => {
-                            let paused = state.dyn_state.toggle_pause();
-                            state.paused = paused;
+                            let now_paused = !state.paused;
+                            if state.dyn_state.set_paused(now_paused) {
+                                state.paused = now_paused;
+                                let msg = if now_paused { "[PAUSED]" } else { "[RESUMED]" };
+                                for tab in &mut state.tabs {
+                                    tab.log.push(msg.to_string());
+                                }
+                            }
                         }
                         KeyCode::Char('+') | KeyCode::Char('=') => {
                             state

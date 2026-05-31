@@ -29,20 +29,22 @@ impl DynState {
         self.paused.load(Ordering::Acquire)
     }
 
-    /// Toggle pause state. Returns true = now paused, false = now running.
-    pub fn toggle_pause(&self) -> bool {
-        // fetch_not toggles bit, returns old value
-        let was_paused = self.paused.fetch_not(Ordering::AcqRel);
-        if was_paused {
-            // was paused, now running — wake waiters
+    /// Set pause state. Returns true if state actually changed.
+    pub fn set_paused(&self, paused: bool) -> bool {
+        let was_paused = self.paused.swap(paused, Ordering::AcqRel);
+        if was_paused && !paused {
             self.resume_notify.notify_waiters();
         }
-        !was_paused
+        was_paused != paused
     }
 
     pub async fn wait_while_paused(&self) {
         while self.is_paused() {
-            self.resume_notify.notified().await;
+            let notified = self.resume_notify.notified();
+            if !self.is_paused() {
+                break;
+            }
+            notified.await;
         }
     }
 }
@@ -69,7 +71,7 @@ impl ProxyStats {
     pub fn avg_time(&self) -> f64 {
         let s = self.successes.load(Ordering::Acquire);
         if s == 0 {
-            return 0.0;
+            return f64::MAX;
         }
         let ns = self.total_time_ns.load(Ordering::Acquire);
         (ns as f64) / (s as f64) / 1_000_000_000.0
