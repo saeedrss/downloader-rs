@@ -6,7 +6,10 @@ Multi-proxy chunk downloader with ratatui TUI.
 
 - Chunked parallel downloads via multiple SOCKS5/HTTP proxies
 - Best-first proxy selection (tracks avg speed per proxy)
-- Adaptive background proxy health checker
+- Dead proxy isolation (connection errors remove proxy from rotation)
+- Background health checker re-tests dead proxies every 20 min (1 at a time)
+- Dedicated proxy pinning with automatic fallback to best-available on failure
+- Atomic semaphore enforces exact max concurrency (no TOCTOU races)
 - Dynamic workers, timeout (runtime-adjustable via keyboard)
 - Pause / Resume
 - Qt-like TUI: header, toolbar, tabbed multi-file, log panel, parts grid, proxy list, status bar
@@ -34,6 +37,7 @@ cargo run --release -- --url <URL> --proxies proxies.txt
 | `--url`              | —                            | URL(s) to download (comma-separated)            |
 | `--proxies`          | —                            | Proxy file path or comma-separated list         |
 | `--size`             | `5`                          | Chunk size in MB                                |
+| `--size-kb`          | —                            | Chunk size in KB (overrides `--size`)           |
 | `--connections`      | `5`                          | Max concurrent downloads                        |
 | `--timeout`          | auto `max(30, size*1024/56)` | Total request timeout (seconds)                 |
 | `--connect-timeout`  | `20`                         | Connect timeout (seconds)                       |

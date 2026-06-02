@@ -25,6 +25,9 @@ struct Args {
     #[arg(long, default_value_t = 5)]
     size: u32,
 
+    #[arg(long)]
+    size_kb: Option<u32>,
+
     #[arg(long, default_value_t = 5)]
     connections: u32,
 
@@ -51,6 +54,24 @@ struct Args {
 
     #[arg(long)]
     useproxyformulticon: bool,
+}
+
+impl Args {
+    fn chunk_size_bytes(&self) -> u64 {
+        if let Some(kb) = self.size_kb {
+            (kb as u64) * 1024
+        } else {
+            (self.size as u64) * 1024 * 1024
+        }
+    }
+
+    fn chunk_size_mb_f64(&self) -> f64 {
+        if let Some(kb) = self.size_kb {
+            kb as f64 / 1024.0
+        } else {
+            self.size as f64
+        }
+    }
 }
 
 fn parse_proxies(raw: &str) -> Vec<String> {
@@ -125,7 +146,7 @@ fn assemble_file(
 
 async fn process_url(
     url: &str,
-    chunk_size_mb: u32,
+    chunk_size: u64,
     max_connections: u32,
     proxy_urls: &[String],
     multi_use: bool,
@@ -137,8 +158,6 @@ async fn process_url(
     on_progress: Arc<dyn Fn(u32, u32) + Send + Sync + 'static>,
     on_proxy_update: Arc<dyn Fn(Vec<(String, f64, u64)>) + Send + Sync + 'static>,
 ) {
-    let chunk_size = (chunk_size_mb as u64) * 1024 * 1024;
-
     let file_name = url
         .split('/')
         .last()
@@ -207,8 +226,9 @@ async fn process_url(
     }
 
     let dyn_mc = dyn_state.max_connections.clone();
-    let sem = Arc::new(DynamicSemaphore::with_getter(
+    let sem = Arc::new(DynamicSemaphore::with_getter_and_extra(
         max_connections,
+        dyn_state.config_notify.clone(),
         move || dyn_mc.load(Ordering::Acquire),
     ));
 
@@ -233,27 +253,19 @@ async fn process_url(
         Arc::new(Mutex::new(
             proxy_clients.iter().map(|(u, _)| u.clone()).collect()
         ));
+    let dead_proxies: Arc<Mutex<Vec<String>>> =
+        Arc::new(Mutex::new(Vec::new()));
     let attempt_counter = Arc::new(AtomicU64::new(0));
     let download_done = Arc::new(Notify::new());
 
-    // Start health checker
-    let hc_proxies = proxy_urls.to_vec();
-    let hc_url = url.to_string();
+    // Start health checker (re-tests dead proxies every 20 min, 1 at a time)
+    let hc_dead = dead_proxies.clone();
     let hc_active = active_proxies.clone();
-    let hc_counter = attempt_counter.clone();
+    let hc_url = url.to_string();
     let hc_done = download_done.clone();
     let hc_log = log.clone();
     tokio::spawn(async move {
-        proxy_health_checker(
-            hc_proxies,
-            hc_url,
-            max_connections,
-            hc_active,
-            hc_counter,
-            hc_done,
-            hc_log,
-        )
-        .await;
+        proxy_health_checker(hc_dead, hc_active, hc_url, hc_done, hc_log).await;
     });
 
     // Worker tasks — one per chunk
@@ -266,6 +278,7 @@ async fn process_url(
         let sem_c = sem.clone();
         let proxy_clients_c = proxy_clients.clone();
         let active_proxies_c = active_proxies.clone();
+        let dead_proxies_c = dead_proxies.clone();
         let proxy_stats_c = proxy_stats.clone();
         let attempt_counter_c = attempt_counter.clone();
         let dyn_state_c = dyn_state.clone();
@@ -289,6 +302,8 @@ async fn process_url(
                 None
             };
 
+            let mut first_attempt = true;
+
             while !success {
                 dyn_state_c.wait_while_paused().await;
 
@@ -297,10 +312,11 @@ async fn process_url(
                 dyn_state_c.wait_while_paused().await;
                 attempt_counter_c.fetch_add(1, Ordering::Release);
 
-                let (proxy_url, client) = if let Some(ref d) = dedicated {
+                let (proxy_url, client) = if dedicated.is_some() && first_attempt {
+                    let d = dedicated.as_ref().unwrap();
                     d.clone()
                 } else {
-                    // multi_use mode: pick best available proxy
+                    // multi_use mode or retry fallback: pick best available proxy
                     let selected = {
                         let ap = active_proxies_c.lock().await;
                         let ps = proxy_stats_c.lock().await;
@@ -363,10 +379,15 @@ async fn process_url(
                             ps.entry(proxy_url.clone())
                                 .or_insert_with(ProxyStats::new)
                                 .record(elapsed);
-                            let items: Vec<(String, f64, u64)> = ps
+                            let mut items: Vec<(String, f64, u64)> = ps
                                 .iter()
                                 .map(|(u, s)| (u.clone(), s.avg_time(), s.successes.load(Ordering::Acquire)))
                                 .collect();
+                            items.sort_by(|a, b| {
+                                let sa = a.2 as f64 / a.1.max(0.001);
+                                let sb = b.2 as f64 / b.1.max(0.001);
+                                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                            });
                             proxy_cb(items);
                             let done = completed_c.fetch_add(1, Ordering::Release) + 1;
                             prog_cb(done as u32, total);
@@ -380,6 +401,7 @@ async fn process_url(
                             get_hex_name(p_num)
                         ));
                         part_cb(p_num, "error", "", 0.0);
+                        first_attempt = false;
                     }
                     Err(e) => {
                         log_c(&format!(
@@ -388,6 +410,20 @@ async fn process_url(
                             e
                         ));
                         part_cb(p_num, "error", "", 0.0);
+                        first_attempt = false;
+                        // Mark proxy as dead on connection-level failure
+                        {
+                            let mut ap = active_proxies_c.lock().await;
+                            if let Some(pos) = ap.iter().position(|p| *p == proxy_url) {
+                                ap.remove(pos);
+                            }
+                        }
+                        {
+                            let mut dp = dead_proxies_c.lock().await;
+                            if !dp.contains(&proxy_url) {
+                                dp.push(proxy_url.clone());
+                            }
+                        }
                     }
                 }
             }
@@ -437,6 +473,13 @@ async fn process_url(
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    if let Some(kb) = args.size_kb {
+        if kb == 0 {
+            eprintln!("[-] Error: --size-kb must be at least 1");
+            std::process::exit(1);
+        }
+    }
+
     let proxy_urls = parse_proxies(&args.proxies);
     if proxy_urls.is_empty() {
         eprintln!("[-] Error: No valid proxies found!");
@@ -450,7 +493,7 @@ fn main() -> Result<()> {
     let url_count = urls.len();
     let timeout = args
         .timeout
-        .unwrap_or_else(|| (args.size as u64 * 1024 / 56).max(30));
+        .unwrap_or_else(|| ((args.chunk_size_mb_f64() * 1024.0) as u64 / 56).max(30));
 
     // Pre-gather file info (blocking call inside a quick async block)
     let file_infos: Vec<Result<u32>> = {
@@ -461,7 +504,7 @@ fn main() -> Result<()> {
                 println!("[*] Checking: {}", url);
                 match get_file_size(url).await {
                     Ok(size) => {
-                        let chunk_size = (args.size as u64) * 1024 * 1024;
+                        let chunk_size = args.chunk_size_bytes();
                         let total_parts = ((size + chunk_size - 1) / chunk_size) as u32;
                         infos.push(Ok(total_parts));
                     }
@@ -532,7 +575,7 @@ fn main() -> Result<()> {
     let d_proxies = proxy_urls.clone();
     let d_multi = args.useproxyformulticon;
     let d_temp = args.temp_dir.clone();
-    let d_size = args.size;
+    let d_chunk_size = args.chunk_size_bytes();
     let d_conn = args.connections;
 
     std::thread::spawn(move || {
@@ -553,7 +596,7 @@ fn main() -> Result<()> {
                 };
 
                 if let Some(file_size) = file_size_opt {
-                    let chunk_size = (d_size as u64) * 1024 * 1024;
+                    let chunk_size = d_chunk_size;
                     let total_parts = ((file_size + chunk_size - 1) / chunk_size) as u32;
                     let _ = d_tx.send(UiEvent::FileStart(
                         tab_idx,
@@ -589,7 +632,7 @@ fn main() -> Result<()> {
 
                     process_url(
                         url,
-                        d_size,
+                        d_chunk_size,
                         d_conn,
                         &d_proxies,
                         d_multi,

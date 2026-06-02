@@ -6,6 +6,7 @@ use tokio::sync::Notify;
 pub struct DynState {
     pub paused: Arc<AtomicBool>,
     pub resume_notify: Arc<Notify>,
+    pub config_notify: Arc<Notify>,
     pub max_connections: Arc<AtomicU32>,
     pub timeout: Arc<AtomicU32>,
     pub connect_timeout: Arc<AtomicU32>,
@@ -18,6 +19,7 @@ impl DynState {
         Self {
             paused: Arc::new(AtomicBool::new(false)),
             resume_notify: Arc::new(Notify::new()),
+            config_notify: Arc::new(Notify::new()),
             max_connections: Arc::new(AtomicU32::new(max_connections)),
             timeout: Arc::new(AtomicU32::new(timeout)),
             connect_timeout: Arc::new(AtomicU32::new(connect_timeout)),
@@ -81,6 +83,7 @@ impl ProxyStats {
 pub struct DynamicSemaphore {
     active: Arc<AtomicU32>,
     notify: Arc<Notify>,
+    extra_notify: Option<Arc<Notify>>,
     max_getter: Option<Box<dyn Fn() -> u32 + Send + Sync>>,
     initial_max: u32,
 }
@@ -91,6 +94,7 @@ impl DynamicSemaphore {
         Self {
             active: Arc::new(AtomicU32::new(0)),
             notify: Arc::new(Notify::new()),
+            extra_notify: None,
             max_getter: None,
             initial_max,
         }
@@ -103,6 +107,20 @@ impl DynamicSemaphore {
         Self {
             active: Arc::new(AtomicU32::new(0)),
             notify: Arc::new(Notify::new()),
+            extra_notify: None,
+            max_getter: Some(Box::new(getter)),
+            initial_max,
+        }
+    }
+
+    pub fn with_getter_and_extra<F>(initial_max: u32, extra: Arc<Notify>, getter: F) -> Self
+    where
+        F: Fn() -> u32 + Send + Sync + 'static,
+    {
+        Self {
+            active: Arc::new(AtomicU32::new(0)),
+            notify: Arc::new(Notify::new()),
+            extra_notify: Some(extra),
             max_getter: Some(Box::new(getter)),
             initial_max,
         }
@@ -117,11 +135,25 @@ impl DynamicSemaphore {
 
     pub async fn acquire(&self) -> AcquireGuard<'_> {
         loop {
-            if self.active.load(Ordering::Acquire) < self.effective_max() {
-                self.active.fetch_add(1, Ordering::Release);
+            let current = self.active.load(Ordering::Acquire);
+            let max = self.effective_max();
+            if current < max
+                && self
+                    .active
+                    .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
                 return AcquireGuard { sem: self };
             }
-            self.notify.notified().await;
+            match &self.extra_notify {
+                Some(n) => {
+                    tokio::select! {
+                        _ = self.notify.notified() => {}
+                        _ = n.notified() => {}
+                    }
+                }
+                None => self.notify.notified().await,
+            }
         }
     }
 

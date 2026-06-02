@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 
 use crate::state::DynState;
 
-pub async fn test_single_proxy(proxy_url: &str, test_url: &str) -> bool {
+pub async fn test_single_proxy(proxy_url: &str, test_url: &str, timeout_secs: u64) -> bool {
     let proxy = match Proxy::all(proxy_url) {
         Ok(p) => p,
         Err(_) => return false,
@@ -20,7 +20,7 @@ pub async fn test_single_proxy(proxy_url: &str, test_url: &str) -> bool {
     };
     match client
         .get(test_url)
-        .timeout(std::time::Duration::from_secs(8))
+        .timeout(std::time::Duration::from_secs(timeout_secs))
         .send()
         .await
     {
@@ -40,7 +40,7 @@ pub async fn filter_alive_proxies(
         let u = url.clone();
         let t = test_url.to_string();
         tasks.push(tokio::spawn(async move {
-            test_single_proxy(&u, &t).await
+            test_single_proxy(&u, &t, 8).await
         }));
     }
     let results = futures::future::join_all(tasks).await;
@@ -136,36 +136,33 @@ pub async fn download_chunk(
 }
 
 pub async fn proxy_health_checker(
-    raw_proxies: Vec<String>,
-    url: String,
-    max_connections: u32,
+    dead_proxies: Arc<Mutex<Vec<String>>>,
     active_proxies: Arc<Mutex<Vec<String>>>,
-    attempt_counter: Arc<AtomicU64>,
+    test_url: String,
     download_done: Arc<tokio::sync::Notify>,
     log: Arc<dyn Fn(&str) + Send + Sync + 'static>,
 ) {
-    let mut last_check: u64 = 0;
-    let check_interval: u64 = if (raw_proxies.len() as f64 * 1.5) > max_connections as f64 {
-        1000
-    } else {
-        200
-    };
-
     loop {
         tokio::select! {
             _ = download_done.notified() => break,
-            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1200)) => {}
         }
 
-        let current = attempt_counter.load(Ordering::Acquire);
-        if current - last_check >= check_interval {
-            last_check = current;
-            log(&format!("\n[*] Proxy health check at attempt {}...", current));
-            let refreshed = filter_alive_proxies(&raw_proxies, &url, &log).await;
-            if !refreshed.is_empty() {
-                let mut ap = active_proxies.lock().await;
-                *ap = refreshed;
+        let proxy = {
+            let mut dead = dead_proxies.lock().await;
+            if dead.is_empty() {
+                continue;
             }
+            dead.remove(0)
+        };
+
+        log(&format!("[*] Re-testing dead proxy: {}", proxy));
+        if test_single_proxy(&proxy, &test_url, 20).await {
+            log(&format!("[+] Dead proxy revived: {}", proxy));
+            active_proxies.lock().await.push(proxy);
+        } else {
+            log(&format!("[-] Proxy still dead: {}", proxy));
+            dead_proxies.lock().await.push(proxy);
         }
     }
 }

@@ -489,6 +489,7 @@ pub fn run_tui(
                                 .dyn_state
                                 .max_connections
                                 .fetch_add(1, Ordering::Release);
+                            state.dyn_state.config_notify.notify_waiters();
                         }
                         KeyCode::Char('-') | KeyCode::Char('_') => {
                             state
@@ -500,6 +501,7 @@ pub fn run_tui(
                                     |x| Some(x.saturating_sub(1).max(1)),
                                 )
                                 .ok();
+                            state.dyn_state.config_notify.notify_waiters();
                         }
                         KeyCode::Char(']') => {
                             state
