@@ -272,6 +272,7 @@ async fn process_url(
     let mut handles = Vec::new();
     let completed_parts = Arc::new(AtomicU64::new(initial_count as u64));
     let total_parts = chunks.len() as u32;
+    let warmup_target = proxy_clients.len();
     for chunk in chunks {
         let dl_dir_c = dl_dir.clone();
         let url_c = url.to_string();
@@ -304,7 +305,7 @@ async fn process_url(
                 dyn_state_c.wait_while_paused().await;
                 attempt_counter_c.fetch_add(1, Ordering::Release);
 
-                // Sort proxies by avg speed and split into fast/explorer tiers
+                // Sort proxies by avg download time (ascending)
                 let sorted_proxies: Vec<String> = {
                     let ap = active_proxies_c.lock().await;
                     let ps = proxy_stats_c.lock().await;
@@ -321,56 +322,11 @@ async fn process_url(
 
                 let proxy_count = sorted_proxies.len();
                 let current_max = dyn_state_c.max_connections.load(Ordering::Acquire);
-                let fast_count = if proxy_count <= 1 {
-                    0
-                } else {
-                    ((current_max as f64 * 0.9).floor() as usize).min(proxy_count - 1)
-                };
+                let warmup = warmup_target > 0
+                    && (completed_c.load(Ordering::Acquire) as usize) < warmup_target;
 
-                // Claim a fast token (atomic CAS) or fall back to explorer tier
-                let is_fast = if fast_count > 0 {
-                    loop {
-                        let used = fast_tokens_c.load(Ordering::Acquire);
-                        if used as usize >= fast_count {
-                            break false;
-                        }
-                        if fast_tokens_c
-                            .compare_exchange_weak(used, used + 1, Ordering::AcqRel, Ordering::Acquire)
-                            .is_ok()
-                        {
-                            break true;
-                        }
-                    }
-                } else {
-                    false
-                };
-
-                let (proxy_url, client) = if is_fast {
-                    let idx = fast_idx_c.fetch_add(1, Ordering::AcqRel) as usize % fast_count;
-                    let u = sorted_proxies[idx].clone();
-                    let c = proxy_clients_c
-                        .iter()
-                        .find(|(pu, _)| pu == &u)
-                        .map(|(_, c)| c.clone())
-                        .unwrap_or_else(|| {
-                            let p = Proxy::all(&u).unwrap();
-                            reqwest::Client::builder().proxy(p).build().unwrap()
-                        });
-                    (u, c)
-                } else if proxy_count > fast_count {
-                    let explorer_count = proxy_count - fast_count;
-                    let idx = explorer_idx_c.fetch_add(1, Ordering::AcqRel) as usize % explorer_count;
-                    let u = sorted_proxies[fast_count + idx].clone();
-                    let c = proxy_clients_c
-                        .iter()
-                        .find(|(pu, _)| pu == &u)
-                        .map(|(_, c)| c.clone())
-                        .unwrap_or_else(|| {
-                            let p = Proxy::all(&u).unwrap();
-                            reqwest::Client::builder().proxy(p).build().unwrap()
-                        });
-                    (u, c)
-                } else {
+                let (proxy_url, client, is_fast) = if warmup {
+                    // Phase 1: try all proxies equally via round-robin
                     let idx = fast_idx_c.fetch_add(1, Ordering::AcqRel) as usize % proxy_count;
                     let u = sorted_proxies[idx].clone();
                     let c = proxy_clients_c
@@ -381,7 +337,70 @@ async fn process_url(
                             let p = Proxy::all(&u).unwrap();
                             reqwest::Client::builder().proxy(p).build().unwrap()
                         });
-                    (u, c)
+                    (u, c, false)
+                } else {
+                    // Phase 2: tiered assignment based on avg_time
+                    let fast_count = if proxy_count <= 1 {
+                        0
+                    } else {
+                        ((current_max as f64 * 0.9).floor() as usize).min(proxy_count - 1)
+                    };
+
+                    let is_fast = if fast_count > 0 {
+                        loop {
+                            let used = fast_tokens_c.load(Ordering::Acquire);
+                            if used as usize >= fast_count {
+                                break false;
+                            }
+                            if fast_tokens_c
+                                .compare_exchange_weak(used, used + 1, Ordering::AcqRel, Ordering::Acquire)
+                                .is_ok()
+                            {
+                                break true;
+                            }
+                        }
+                    } else {
+                        false
+                    };
+
+                    if is_fast {
+                        let idx = fast_idx_c.fetch_add(1, Ordering::AcqRel) as usize % fast_count;
+                        let u = sorted_proxies[idx].clone();
+                        let c = proxy_clients_c
+                            .iter()
+                            .find(|(pu, _)| pu == &u)
+                            .map(|(_, c)| c.clone())
+                            .unwrap_or_else(|| {
+                                let p = Proxy::all(&u).unwrap();
+                                reqwest::Client::builder().proxy(p).build().unwrap()
+                            });
+                        (u, c, true)
+                    } else if proxy_count > fast_count {
+                        let explorer_count = proxy_count - fast_count;
+                        let idx = explorer_idx_c.fetch_add(1, Ordering::AcqRel) as usize % explorer_count;
+                        let u = sorted_proxies[fast_count + idx].clone();
+                        let c = proxy_clients_c
+                            .iter()
+                            .find(|(pu, _)| pu == &u)
+                            .map(|(_, c)| c.clone())
+                            .unwrap_or_else(|| {
+                                let p = Proxy::all(&u).unwrap();
+                                reqwest::Client::builder().proxy(p).build().unwrap()
+                            });
+                        (u, c, false)
+                    } else {
+                        let idx = fast_idx_c.fetch_add(1, Ordering::AcqRel) as usize % proxy_count;
+                        let u = sorted_proxies[idx].clone();
+                        let c = proxy_clients_c
+                            .iter()
+                            .find(|(pu, _)| pu == &u)
+                            .map(|(_, c)| c.clone())
+                            .unwrap_or_else(|| {
+                                let p = Proxy::all(&u).unwrap();
+                                reqwest::Client::builder().proxy(p).build().unwrap()
+                            });
+                        (u, c, false)
+                    }
                 };
 
                 let part_name = get_hex_name(p_num);
@@ -410,11 +429,7 @@ async fn process_url(
                                 .iter()
                                 .map(|(u, s)| (u.clone(), s.avg_time(), s.successes.load(Ordering::Acquire)))
                                 .collect();
-                            items.sort_by(|a, b| {
-                                let sa = a.2 as f64 / a.1.max(0.001);
-                                let sb = b.2 as f64 / b.1.max(0.001);
-                                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-                            });
+                            items.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
                             proxy_cb(items);
                             let done = completed_c.fetch_add(1, Ordering::Release) + 1;
                             prog_cb(done as u32, total);
