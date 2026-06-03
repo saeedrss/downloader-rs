@@ -4,7 +4,7 @@ mod tui;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -52,8 +52,6 @@ struct Args {
     #[arg(long, default_value_t = String::from("temp"))]
     temp_dir: String,
 
-    #[arg(long)]
-    useproxyformulticon: bool,
 }
 
 impl Args {
@@ -149,7 +147,6 @@ async fn process_url(
     chunk_size: u64,
     max_connections: u32,
     proxy_urls: &[String],
-    multi_use: bool,
     output_path: &Path,
     temp_dir: &Path,
     dyn_state: DynState,
@@ -255,6 +252,9 @@ async fn process_url(
         ));
     let dead_proxies: Arc<Mutex<Vec<String>>> =
         Arc::new(Mutex::new(Vec::new()));
+    let fast_tokens: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+    let fast_idx: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+    let explorer_idx: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
     let attempt_counter = Arc::new(AtomicU64::new(0));
     let download_done = Arc::new(Notify::new());
 
@@ -279,6 +279,9 @@ async fn process_url(
         let proxy_clients_c = proxy_clients.clone();
         let active_proxies_c = active_proxies.clone();
         let dead_proxies_c = dead_proxies.clone();
+        let fast_tokens_c = fast_tokens.clone();
+        let fast_idx_c = fast_idx.clone();
+        let explorer_idx_c = explorer_idx.clone();
         let proxy_stats_c = proxy_stats.clone();
         let attempt_counter_c = attempt_counter.clone();
         let dyn_state_c = dyn_state.clone();
@@ -293,17 +296,6 @@ async fn process_url(
             let (start, end, p_num) = chunk;
             let mut success = false;
 
-            // Default mode: pin this chunk to one dedicated proxy
-            let dedicated = if !multi_use {
-                let idx = p_num as usize % proxy_clients_c.len();
-                let (u, c) = proxy_clients_c[idx].clone();
-                Some((u, c))
-            } else {
-                None
-            };
-
-            let mut first_attempt = true;
-
             while !success {
                 dyn_state_c.wait_while_paused().await;
 
@@ -312,49 +304,84 @@ async fn process_url(
                 dyn_state_c.wait_while_paused().await;
                 attempt_counter_c.fetch_add(1, Ordering::Release);
 
-                let (proxy_url, client) = if dedicated.is_some() && first_attempt {
-                    let d = dedicated.as_ref().unwrap();
-                    d.clone()
-                } else {
-                    // multi_use mode or retry fallback: pick best available proxy
-                    let selected = {
-                        let ap = active_proxies_c.lock().await;
-                        let ps = proxy_stats_c.lock().await;
-                        let mut pairs: Vec<(&String, f64)> = ap
-                            .iter()
-                            .map(|u| {
-                                let avg = ps.get(u).map(|s| s.avg_time()).unwrap_or(f64::MAX);
-                                (u, avg)
-                            })
-                            .collect();
-                        pairs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-                        let best_avg = pairs.first().map(|(_, a)| *a).unwrap_or(0.0);
-                        let tie_count = pairs.iter().filter(|(_, a)| *a == best_avg).count();
-                        let idx = (p_num as usize) % tie_count;
-                        pairs.get(idx).map(|(u, _)| (*u).clone())
-                    };
+                // Sort proxies by avg speed and split into fast/explorer tiers
+                let sorted_proxies: Vec<String> = {
+                    let ap = active_proxies_c.lock().await;
+                    let ps = proxy_stats_c.lock().await;
+                    let mut pairs: Vec<(&String, f64)> = ap
+                        .iter()
+                        .map(|u| {
+                            let avg = ps.get(u).map(|s| s.avg_time()).unwrap_or(f64::MAX);
+                            (u, avg)
+                        })
+                        .collect();
+                    pairs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                    pairs.into_iter().map(|(u, _)| u.clone()).collect()
+                };
 
-                    match selected {
-                        Some(ref u) => {
-                            let c = proxy_clients_c
-                                .iter()
-                                .find(|(pu, _)| pu == u)
-                                .map(|(_, c)| c.clone())
-                                .unwrap_or_else(|| {
-                                    let p = Proxy::all(u).unwrap();
-                                    reqwest::Client::builder()
-                                        .proxy(p)
-                                        .build()
-                                        .unwrap()
-                                });
-                            (u.clone(), c)
+                let proxy_count = sorted_proxies.len();
+                let current_max = dyn_state_c.max_connections.load(Ordering::Acquire);
+                let fast_count = if proxy_count <= 1 {
+                    0
+                } else {
+                    ((current_max as f64 * 0.9).floor() as usize).min(proxy_count - 1)
+                };
+
+                // Claim a fast token (atomic CAS) or fall back to explorer tier
+                let is_fast = if fast_count > 0 {
+                    loop {
+                        let used = fast_tokens_c.load(Ordering::Acquire);
+                        if used as usize >= fast_count {
+                            break false;
                         }
-                        None => {
-                            log_c("[X] No proxy available, sleeping 10s...");
-                            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                            continue;
+                        if fast_tokens_c
+                            .compare_exchange_weak(used, used + 1, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                        {
+                            break true;
                         }
                     }
+                } else {
+                    false
+                };
+
+                let (proxy_url, client) = if is_fast {
+                    let idx = fast_idx_c.fetch_add(1, Ordering::AcqRel) as usize % fast_count;
+                    let u = sorted_proxies[idx].clone();
+                    let c = proxy_clients_c
+                        .iter()
+                        .find(|(pu, _)| pu == &u)
+                        .map(|(_, c)| c.clone())
+                        .unwrap_or_else(|| {
+                            let p = Proxy::all(&u).unwrap();
+                            reqwest::Client::builder().proxy(p).build().unwrap()
+                        });
+                    (u, c)
+                } else if proxy_count > fast_count {
+                    let explorer_count = proxy_count - fast_count;
+                    let idx = explorer_idx_c.fetch_add(1, Ordering::AcqRel) as usize % explorer_count;
+                    let u = sorted_proxies[fast_count + idx].clone();
+                    let c = proxy_clients_c
+                        .iter()
+                        .find(|(pu, _)| pu == &u)
+                        .map(|(_, c)| c.clone())
+                        .unwrap_or_else(|| {
+                            let p = Proxy::all(&u).unwrap();
+                            reqwest::Client::builder().proxy(p).build().unwrap()
+                        });
+                    (u, c)
+                } else {
+                    let idx = fast_idx_c.fetch_add(1, Ordering::AcqRel) as usize % proxy_count;
+                    let u = sorted_proxies[idx].clone();
+                    let c = proxy_clients_c
+                        .iter()
+                        .find(|(pu, _)| pu == &u)
+                        .map(|(_, c)| c.clone())
+                        .unwrap_or_else(|| {
+                            let p = Proxy::all(&u).unwrap();
+                            reqwest::Client::builder().proxy(p).build().unwrap()
+                        });
+                    (u, c)
                 };
 
                 let part_name = get_hex_name(p_num);
@@ -401,7 +428,6 @@ async fn process_url(
                             get_hex_name(p_num)
                         ));
                         part_cb(p_num, "error", "", 0.0);
-                        first_attempt = false;
                     }
                     Err(e) => {
                         log_c(&format!(
@@ -410,7 +436,6 @@ async fn process_url(
                             e
                         ));
                         part_cb(p_num, "error", "", 0.0);
-                        first_attempt = false;
                         // Mark proxy as dead on connection-level failure
                         {
                             let mut ap = active_proxies_c.lock().await;
@@ -425,6 +450,10 @@ async fn process_url(
                             }
                         }
                     }
+                }
+
+                if is_fast {
+                    fast_tokens_c.fetch_sub(1, Ordering::Release);
                 }
             }
         }));
@@ -573,7 +602,6 @@ fn main() -> Result<()> {
     let d_urls = download_urls.clone();
     let d_paths = output_paths.clone();
     let d_proxies = proxy_urls.clone();
-    let d_multi = args.useproxyformulticon;
     let d_temp = args.temp_dir.clone();
     let d_chunk_size = args.chunk_size_bytes();
     let d_conn = args.connections;
@@ -635,7 +663,6 @@ fn main() -> Result<()> {
                         d_chunk_size,
                         d_conn,
                         &d_proxies,
-                        d_multi,
                         &d_paths[tab_idx],
                         Path::new(&d_temp),
                         d_dyn.clone(),

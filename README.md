@@ -8,7 +8,7 @@ Multi-proxy chunk downloader with ratatui TUI.
 - Best-first proxy selection (tracks avg speed per proxy)
 - Dead proxy isolation (connection errors remove proxy from rotation)
 - Background health checker re-tests dead proxies every 20 min (1 at a time)
-- Dedicated proxy pinning with automatic fallback to best-available on failure
+- Weighted tiered proxy assignment (90% fast tier / 10% explorer tier, re-ranked every part)
 - Atomic semaphore enforces exact max concurrency (no TOCTOU races)
 - Dynamic workers, timeout (runtime-adjustable via keyboard)
 - Pause / Resume
@@ -45,7 +45,6 @@ cargo run --release -- --url <URL> --proxies proxies.txt
 | `--output`           | —                            | Output file path (single URL only)              |
 | `--output-dir`       | `.`                          | Output directory                                |
 | `--temp-dir`         | `temp`                       | Temporary directory for parts                   |
-| `--useproxyformulticon` | —                         | Allow one proxy for multiple connections        |
 
 ## Keyboard Controls
 
