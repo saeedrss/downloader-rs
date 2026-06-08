@@ -12,7 +12,9 @@ use clap::Parser;
 use reqwest::Proxy;
 use tokio::sync::{Mutex, Notify};
 
-use download::{download_chunk, filter_alive_proxies, proxy_health_checker};
+use download::{
+    download_chunk, filter_alive_proxies, get_file_size_with_fallback, proxy_health_checker,
+};
 use state::{DynState, DynamicSemaphore, ProxyStats};
 use tui::{PartStatus, TabState, TuiState, UiEvent};
 
@@ -92,30 +94,6 @@ fn parse_proxies(raw: &str) -> Vec<String> {
     }
 }
 
-async fn get_file_size(url: &str) -> Result<u64> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(url)
-        .header("User-Agent", "curl/8.14.1")
-        .header("Accept", "*/*")
-        .timeout(std::time::Duration::from_secs(15))
-        .send()
-        .await?;
-    if !resp.status().is_success() && resp.status().as_u16() != 206 {
-        return Err(anyhow!("Server returned status {}", resp.status()));
-    }
-    let size: u64 = resp
-        .headers()
-        .get(reqwest::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| anyhow!("Content-Length not found"))?;
-    if size == 0 {
-        return Err(anyhow!("File size is 0"));
-    }
-    Ok(size)
-}
-
 fn get_hex_name(part_num: u32) -> String {
     format!("{:x}", part_num)
 }
@@ -144,6 +122,7 @@ fn assemble_file(
 
 async fn process_url(
     url: &str,
+    file_size: u64,
     chunk_size: u64,
     max_connections: u32,
     proxy_urls: &[String],
@@ -164,16 +143,8 @@ async fn process_url(
     std::fs::create_dir_all(&dl_dir).unwrap();
     log(&format!("[*] Target download directory set to: {}", dl_dir.display()));
 
-    log("[*] Connecting directly to VPS to fetch file size...");
-    let file_size = match get_file_size(url).await {
-        Ok(s) => s,
-        Err(e) => {
-            log(&format!("[-] Failed to get file size: {}", e));
-            return;
-        }
-    };
     log(&format!(
-        "[*] Total File Size: {:.2} GB ({} bytes)",
+        "[*] File size: {:.2} GB ({} bytes)",
         file_size as f64 / 1_073_741_824.0,
         file_size
     ));
@@ -544,9 +515,11 @@ fn main() -> Result<()> {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
             let mut infos = Vec::new();
+            let plog = |msg: &str| println!("{}", msg);
+            let plog_arc: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(plog);
             for url in &urls {
                 println!("[*] Checking: {}", url);
-                match get_file_size(url).await {
+                match get_file_size_with_fallback(url, &proxy_urls, &plog_arc).await {
                     Ok(size) => {
                         let chunk_size = args.chunk_size_bytes();
                         let total_parts = ((size + chunk_size - 1) / chunk_size) as u32;
@@ -625,71 +598,64 @@ fn main() -> Result<()> {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             for (tab_idx, url) in d_urls.iter().enumerate() {
-                let file_size_opt: Option<u64> = {
-                    match get_file_size(url).await {
-                        Ok(s) => Some(s),
-                        Err(_) => {
-                            let _ = d_tx.send(UiEvent::Log(
-                                tab_idx,
-                                format!("[-] Failed to get file size: {}", url),
-                            ));
-                            None
-                        }
+                let log_tx = d_tx.clone();
+                let log: Arc<dyn Fn(&str) + Send + Sync + 'static> = Arc::new(move |msg: &str| {
+                    let _ = log_tx.send(UiEvent::Log(tab_idx, msg.to_string()));
+                });
+
+                let file_size = match get_file_size_with_fallback(url, &d_proxies, &log).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log(&format!("[-] Failed to get file size: {}", e));
+                        continue;
                     }
                 };
 
-                if let Some(file_size) = file_size_opt {
-                    let chunk_size = d_chunk_size;
-                    let total_parts = ((file_size + chunk_size - 1) / chunk_size) as u32;
-                    let _ = d_tx.send(UiEvent::FileStart(
-                        tab_idx,
-                        url.clone(),
-                        total_parts,
-                    ));
+                let total_parts = ((file_size + d_chunk_size - 1) / d_chunk_size) as u32;
+                let _ = d_tx.send(UiEvent::FileStart(
+                    tab_idx,
+                    url.clone(),
+                    total_parts,
+                ));
 
-                    let log_tx = d_tx.clone();
-                    let log = Arc::new(move |msg: &str| {
-                        let _ = log_tx.send(UiEvent::Log(tab_idx, msg.to_string()));
-                    });
+                let part_tx = d_tx.clone();
+                let part_cb = Arc::new(move |pn: u32, status: &str, _proxy: &str, elapsed: f64| {
+                    let s = match status {
+                        "finished" => PartStatus::Finished,
+                        "downloading" => PartStatus::Downloading,
+                        "error" => PartStatus::Error,
+                        _ => PartStatus::Idle,
+                    };
+                    let _ = part_tx.send(UiEvent::PartUpdate(tab_idx, pn, s, elapsed));
+                });
 
-                    let part_tx = d_tx.clone();
-                    let part_cb = Arc::new(move |pn: u32, status: &str, _proxy: &str, elapsed: f64| {
-                        let s = match status {
-                            "finished" => PartStatus::Finished,
-                            "downloading" => PartStatus::Downloading,
-                            "error" => PartStatus::Error,
-                            _ => PartStatus::Idle,
-                        };
-                        let _ = part_tx.send(UiEvent::PartUpdate(tab_idx, pn, s, elapsed));
-                    });
+                let prog_tx = d_tx.clone();
+                let prog_cb = Arc::new(move |done: u32, total: u32| {
+                    let _ = prog_tx.send(UiEvent::Progress(tab_idx, done, total));
+                });
 
-                    let prog_tx = d_tx.clone();
-                    let prog_cb = Arc::new(move |done: u32, total: u32| {
-                        let _ = prog_tx.send(UiEvent::Progress(tab_idx, done, total));
-                    });
+                let proxy_tx = d_tx.clone();
+                let proxy_cb = Arc::new(move |items: Vec<(String, f64, u64)>| {
+                    let _ = proxy_tx.send(UiEvent::ProxyUpdate(tab_idx, items));
+                });
 
-                    let proxy_tx = d_tx.clone();
-                    let proxy_cb = Arc::new(move |items: Vec<(String, f64, u64)>| {
-                        let _ = proxy_tx.send(UiEvent::ProxyUpdate(tab_idx, items));
-                    });
+                process_url(
+                    url,
+                    file_size,
+                    d_chunk_size,
+                    d_conn,
+                    &d_proxies,
+                    &d_paths[tab_idx],
+                    Path::new(&d_temp),
+                    d_dyn.clone(),
+                    log,
+                    part_cb,
+                    prog_cb,
+                    proxy_cb,
+                )
+                .await;
 
-                    process_url(
-                        url,
-                        d_chunk_size,
-                        d_conn,
-                        &d_proxies,
-                        &d_paths[tab_idx],
-                        Path::new(&d_temp),
-                        d_dyn.clone(),
-                        log,
-                        part_cb,
-                        prog_cb,
-                        proxy_cb,
-                    )
-                    .await;
-
-                    let _ = d_tx.send(UiEvent::FileComplete(tab_idx));
-                }
+                let _ = d_tx.send(UiEvent::FileComplete(tab_idx));
             }
 
             let _ = d_tx.send(UiEvent::AllDone);
