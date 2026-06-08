@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use reqwest::Proxy;
 use tokio::sync::Mutex;
 
@@ -27,6 +27,85 @@ pub async fn test_single_proxy(proxy_url: &str, test_url: &str, timeout_secs: u6
         Ok(resp) => resp.status().is_success() || resp.status().as_u16() == 206,
         Err(_) => false,
     }
+}
+
+pub async fn get_file_size_direct(url: &str) -> Result<u64> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(url)
+        .header("User-Agent", "curl/8.14.1")
+        .header("Accept", "*/*")
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await?;
+    if !resp.status().is_success() && resp.status().as_u16() != 206 {
+        return Err(anyhow!("Server returned status {}", resp.status()));
+    }
+    let size: u64 = resp
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| anyhow!("Content-Length not found"))?;
+    if size == 0 {
+        return Err(anyhow!("File size is 0"));
+    }
+    Ok(size)
+}
+
+pub async fn get_file_size_via_proxy(url: &str, proxy_url: &str) -> Result<u64> {
+    let proxy = Proxy::all(proxy_url)
+        .map_err(|e| anyhow!("Invalid proxy {}: {}", proxy_url, e))?;
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| anyhow!("Failed to build proxy client: {}", e))?;
+    let resp = client
+        .get(url)
+        .header("User-Agent", "curl/8.14.1")
+        .header("Accept", "*/*")
+        .send()
+        .await?;
+    if !resp.status().is_success() && resp.status().as_u16() != 206 {
+        return Err(anyhow!("Server returned status {}", resp.status()));
+    }
+    let size: u64 = resp
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| anyhow!("Content-Length not found"))?;
+    if size == 0 {
+        return Err(anyhow!("File size is 0"));
+    }
+    Ok(size)
+}
+
+pub async fn get_file_size_with_fallback(
+    url: &str,
+    proxies: &[String],
+    log: &Arc<dyn Fn(&str) + Send + Sync>,
+) -> Result<u64> {
+    log("[*] Trying direct connection to fetch file info...");
+    match get_file_size_direct(url).await {
+        Ok(size) => return Ok(size),
+        Err(e) => log(&format!("[-] Direct connection failed: {}", e)),
+    }
+
+    let mut last_err = anyhow!("All proxies exhausted");
+    for proxy_url in proxies {
+        log(&format!("[*] Trying proxy {} to fetch file info...", proxy_url));
+        match get_file_size_via_proxy(url, proxy_url).await {
+            Ok(size) => return Ok(size),
+            Err(e) => {
+                log(&format!("[-] Proxy {} failed: {}", proxy_url, e));
+                last_err = e;
+            }
+        }
+    }
+
+    Err(last_err)
 }
 
 pub async fn filter_alive_proxies(
