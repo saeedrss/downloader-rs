@@ -138,9 +138,15 @@ async fn process_url(
         .split('/')
         .last()
         .unwrap_or("downloaded_file")
+        .split('?')
+        .next()
+        .unwrap_or("downloaded_file")
         .to_string();
     let dl_dir = temp_dir.join(&file_name);
-    std::fs::create_dir_all(&dl_dir).unwrap();
+    if let Err(e) = std::fs::create_dir_all(&dl_dir) {
+        log(&format!("[-] Failed to create download directory: {}", e));
+        return;
+    }
     log(&format!("[*] Target download directory set to: {}", dl_dir.display()));
 
     log(&format!(
