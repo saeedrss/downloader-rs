@@ -1,6 +1,9 @@
 mod state;
 mod download;
 mod tui;
+mod gui;
+mod models;
+mod widgets;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -54,6 +57,8 @@ struct Args {
     #[arg(long, default_value_t = String::from("temp"))]
     temp_dir: String,
 
+    #[arg(long, default_value_t = false)]
+    gui: bool,
 }
 
 impl Args {
@@ -499,6 +504,11 @@ fn main() -> Result<()> {
             eprintln!("[-] Error: --size-kb must be at least 1");
             std::process::exit(1);
         }
+    }
+
+    if args.gui {
+        gui::run_gui();
+        return Ok(());
     }
 
     let proxy_urls = parse_proxies(&args.proxies);
